@@ -4,35 +4,29 @@
 #include <limits>
 #include <set>
 #include <map>
-// Speciation solver stub: will implement equilibrium & mass balance later
+#include <Eigen/Dense>
+// === Main Speciation Solver Interface ===
 void solveSpeciation(std::vector<AqueousSpecies>& species,
                      Solution& solution,
                      const TotalInput& input) {
     std::cout << "\n=== Speciation Solver ===\n";
-    // STEP 1: Placeholder printout of total inputs
     std::cout << "Total element inputs (mol/L):\n";
     for (const auto& pair : input.totals) {
         std::cout << "  " << pair.first << ": " << pair.second << "\n";
     }
-    // STEP 2: Detect elements and build stoichiometric matrix
-    auto elements = detectUniqueElements(species);
     auto stoichMatrix = buildStoichiometricMatrix(species);
-    // STEP 3: Compute residuals from current concentrations
-    auto residuals = computeMassBalanceResiduals(species, solution, input, stoichMatrix);
-    std::cout << "\nMass balance residuals:\n";
-    for (const auto& r : residuals) {
-        std::cout << "  " << r.first << ": " << r.second << "\n";
+    newtonSolve(species, solution, input, stoichMatrix);
+    std::cout << "\nFinal species concentrations:\n";
+    for (const auto& sp : species) {
+        std::cout << "  " << sp.name << ": " << solution.concentrations[sp.name] << "\n";
     }
-    // STEP 4: TODO - Solve for equilibrium species concentrations (Newton-Raphson or iterative update)
 }
-// Extract elemental components from a species name or stoichiometry key
-// For now, assume top-level species names or stoichiometry keys are elements or known labels
+// === Element Detection from Species ===
 std::set<std::string> detectUniqueElements(const std::vector<AqueousSpecies>& species) {
     std::set<std::string> elements;
     for (const auto& sp : species) {
         for (const auto& comp : sp.stoichiometry) {
             const std::string& label = comp.first;
-            // Crude heuristic: if the label contains no digits or symbols, assume it's an element
             bool isElement = true;
             for (char c : label) {
                 if (isdigit(c) || c == '+' || c == '-' || c == '(' || c == ')') {
@@ -47,20 +41,18 @@ std::set<std::string> detectUniqueElements(const std::vector<AqueousSpecies>& sp
     }
     return elements;
 }
-// Builds a stoichiometric coefficient matrix: element -> species -> coefficient
+// === Build Stoichiometric Matrix ===
 std::map<std::string, std::map<std::string, int>>
 buildStoichiometricMatrix(const std::vector<AqueousSpecies>& species) {
     std::map<std::string, std::map<std::string, int>> matrix;
     for (const auto& sp : species) {
         for (const auto& comp : sp.stoichiometry) {
-            const std::string& element = comp.first;
-            int coeff = comp.second;
-            matrix[element][sp.name] += coeff;
+            matrix[comp.first][sp.name] += comp.second;
         }
     }
     return matrix;
 }
-// Compute mass balance residuals: element-wise difference between total input and sum of species contributions
+// === Compute Mass Balance Residuals ===
 std::map<std::string, double>
 computeMassBalanceResiduals(const std::vector<AqueousSpecies>& species,
                             const Solution& solution,
@@ -82,4 +74,88 @@ computeMassBalanceResiduals(const std::vector<AqueousSpecies>& species,
         residuals[element] = sum - total;
     }
     return residuals;
+}
+// === Newton-Raphson Solver ===
+void newtonSolve(std::vector<AqueousSpecies>& species,
+                 Solution& solution,
+                 const TotalInput& input,
+                 const std::map<std::string, std::map<std::string, int>>& stoichMatrix) {
+    const double tol = 1e-8;
+    const int max_iter = 50;
+    const double perturb = 1e-6;
+    std::vector<std::string> speciesNames;
+    for (const auto& sp : species) {
+        speciesNames.push_back(sp.name);
+        if (solution.concentrations.count(sp.name) == 0) {
+            solution.concentrations[sp.name] = 1e-10;  // initialize
+        }
+    }
+    for (int iter = 0; iter < max_iter; ++iter) {
+        evaluateMassAction(species, solution);  // update secondary species from primaries
+        auto residuals = computeMassBalanceResiduals(species, solution, input, stoichMatrix);
+        std::vector<std::string> elements;
+        for (const auto& r : residuals) {
+            elements.push_back(r.first);
+        }
+        Eigen::VectorXd f(elements.size());
+        for (size_t i = 0; i < elements.size(); ++i) {
+            f(i) = residuals[elements[i]];
+        }
+        if (f.norm() < tol) {
+            std::cout << "Converged in " << iter << " iterations.\n";
+            return;
+        }
+        Eigen::MatrixXd J(elements.size(), speciesNames.size());
+        for (size_t j = 0; j < speciesNames.size(); ++j) {
+            std::string sj = speciesNames[j];
+            double original = solution.concentrations[sj];
+            double delta = std::max(original * 0.01, perturb);
+            solution.concentrations[sj] += delta;
+            evaluateMassAction(species, solution);  // recalculate secondary species
+            auto perturbed = computeMassBalanceResiduals(species, solution, input, stoichMatrix);
+            solution.concentrations[sj] = original;
+            evaluateMassAction(species, solution);  // reset
+            for (size_t i = 0; i < elements.size(); ++i) {
+                double df = perturbed[elements[i]] - residuals[elements[i]];
+                J(i, j) = df / delta;
+            }
+        }
+        Eigen::VectorXd delta = J.colPivHouseholderQr().solve(-f);
+        for (size_t j = 0; j < speciesNames.size(); ++j) {
+            std::string sj = speciesNames[j];
+            solution.concentrations[sj] += delta(j);
+            if (solution.concentrations[sj] < 0) {
+                solution.concentrations[sj] = 1e-12;
+            }
+        }
+    }
+    std::cout << "Newton-Raphson did not converge after " << max_iter << " iterations.\n";
+}
+// === Mass Action Law Evaluation ===
+void evaluateMassAction(std::vector<AqueousSpecies>& species, const Solution& solution) {
+    std::map<std::string, double> activities;
+    for (const auto& sp : species) {
+        if (sp.isPrimary) {
+            double conc = solution.concentrations.count(sp.name) ? solution.concentrations.at(sp.name) : 1e-12;
+            double act = conc * sp.activityCoefficient;
+            activities[sp.name] = act;
+        }
+    }
+    for (auto& sp : species) {
+        if (!sp.isPrimary) {
+            double log_conc = sp.logK;
+            for (const auto& pair : sp.stoichiometry) {
+                const std::string& component = pair.first;
+                int coeff = pair.second;
+                if (activities.count(component)) {
+                    log_conc += coeff * std::log10(activities.at(component));
+                } else {
+                    log_conc += coeff * std::log10(1e-12);
+                }
+            }
+            sp.concentration = std::pow(10.0, log_conc);
+        }
+        // Write back into solution
+        solution.concentrations[sp.name] = sp.concentration;
+    }
 }
