@@ -12,6 +12,7 @@ struct AqueousSpecies {
    std::map<std::string, int> stoichiometry;  // {component -> coefficient}
    double activityCoefficient = 1.0;          // Calculated later via Pitzer
    double concentration = 0.0;                // mol/L (can be initialized later)
+   bool isPrimary = false;
 };
 // Represents a solid phase with a solubility product
 struct SolidPhase {
